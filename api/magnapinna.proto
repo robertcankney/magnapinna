@@ -1,0 +1,10 @@
+service Magnapinna {
+    rpc Register(Registration) returns (Lease) {}
+    rpc Deregister(Registration) returns (Lease) {}
+    rpc JoinCluster(stream Output) returns (stream Command) {}
+    rpc StartSession(stream Command) returns (stream Output) {}
+} 
+
+message Registration {
+    string identifier = 1;
+}
