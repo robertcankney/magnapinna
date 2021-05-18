@@ -1,7 +1,6 @@
 package tty
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,38 +15,33 @@ import (
 	"golang.org/x/term"
 )
 
+// TODO: add filtering for repeated bash prompts
+
+// Terminal is the type responsible for creating and managing ptys, as well
+// as managing and buffering IO for the process running in the pty.
 type Terminal struct {
-	Stdin    io.Writer
 	stdout   chan []byte
 	stdin    chan []byte
+	ctx      context.Context
 	shell    *exec.Cmd
 	shellout poller
 	shellin  poller
 	errors   chan error
 }
 
+// poller wraps an open file descriptor, as well as a buffer for IO with the pty.
 type poller struct {
-	out    *os.File
-	in     *os.File
+	handle *os.File
 	buffer []byte
+	data   int64
 }
 
-type readwriter struct {
-	*bytes.Buffer
-}
+// ErrPtsWrite is returned when the write to stdin of the pts' process fails.
+var ErrPtsWrite = errors.New("failed to write to pts for stdin")
 
-var ErrIn = errors.New("failed to write to stdin")
+const bufferSize = 1024 * 32
 
-const bufferSize = 1024 * 256
-
-// func (r *readwriter) Write(b []byte) (n int, err error) {
-// 	return r.Buffer.Write(b)
-// }
-
-// func (r *readwriter) Read(b []byte) (n int, err error) {
-// 	return r.Buffer.Read(b)
-// }
-
+// NewTerminal creates a new pair of ptys, and runs command using the create ptys for IO.
 func NewTerminal(ctx context.Context, command string, args ...string) (*Terminal, error) {
 	cmd := exec.Command(command, args...)
 	winsz := &pty.Winsize{
@@ -69,36 +63,42 @@ func NewTerminal(ctx context.Context, command string, args ...string) (*Terminal
 	}
 	pts, err := os.OpenFile(name, os.O_RDWR|syscall.O_NOCTTY, 0)
 	if err != nil {
-		return nil, fmt.Errorf("could not open %s: %w", name, err)
+		return nil, fmt.Errorf("could not open pty %s: %w", name, err)
 	}
-
 	_, err = term.MakeRaw(int(ptmx.Fd()))
 	if err != nil {
-		return nil, fmt.Errorf("could not open %s: %w", name, err)
+		return nil, fmt.Errorf("could not set pty %s to raw mode: %w", name, err)
 	}
+
 	return &Terminal{
 		shell: cmd,
+		ctx:   ctx,
 		shellout: poller{
-			out:    ptmx,
+			handle: ptmx,
 			buffer: make([]byte, bufferSize),
 		},
 		shellin: poller{
-			in:     pts,
+			handle: pts,
 			buffer: make([]byte, bufferSize),
 		},
 		stdout: make(chan []byte),
-		stdin:  make(chan []byte),
+		stdin:  make(chan []byte, 1),
 	}, nil
 }
 
+// Errors returns a read-only channel to receive errors from the Terminal. Note that
+// errors from the actual process using the ptys will be returned on the Out channel -
+// these will be errors from the Terminal itself.
 func (t *Terminal) Errors() <-chan error {
 	return t.errors
 }
 
+// Out returns a read-only channel to receive output from the Terminal.
 func (t *Terminal) Out() <-chan []byte {
 	return t.stdout
 }
 
+// Start starts the process passed in to NewTerminal, and begins buffering IO for the process.
 func (t *Terminal) Start() error {
 	go t.wait()
 	go t.outpoll()
@@ -111,43 +111,47 @@ func (t *Terminal) wait() {
 	t.errors <- err
 }
 
-// TODO better error handling and context handling for both polls
+// TODO combine both polls to avoid hot read/EOF loop below
+// outpoll and inpoll read and write data from the appropriate channels to the
+// stdin and stdout of the pty.
 func (t *Terminal) outpoll() {
-	total := 0
-	tmp := make([]byte, len(t.shellout.buffer))
 	for {
-		n := 0
-		var err error
-		for err == nil {
-			n, err = t.shellout.out.Read(t.shellout.buffer)
-			total += n
-			copy(tmp, t.shellout.buffer)
-			t.stdout <- t.shellout.buffer[:n]
-			t.shellout.buffer = t.shellout.buffer[:]
-			tmp = tmp[:]
+		select {
+		case <-t.ctx.Done():
+			err := t.shellout.handle.Close()
+			if err != nil {
+				t.errors <- err
+			}
+		default:
+			n := 0
+			var err error
+			for err == nil {
+				n, err = t.shellout.handle.Read(t.shellout.buffer)
+				t.shellout.data += int64(n)
+				t.stdout <- t.shellout.buffer[:n]
+			}
+			if err == io.EOF {
+				continue
+			}
+			t.errors <- err
 		}
-		if err == io.EOF {
-			continue
-		}
-		t.errors <- err
 	}
 }
 
 func (t *Terminal) inpoll() {
-	total := 0
 	for {
 		n := 0
 		var err error
 		for err == nil {
 			b := <-t.stdin
 			for _, c := range b {
-				err = tiocsti(t.shellin.in, c)
+				err = tiocsti(t.shellin.handle, c)
 				if err != nil {
-					fmt.Println(err.Error())
+					t.errors <- fmt.Errorf("%w: %s", ErrPtsWrite, err.Error())
 				}
 				n++
 			}
-			total += n
+			t.shellout.data += int64(n)
 		}
 		if err == io.EOF {
 			continue
@@ -156,10 +160,15 @@ func (t *Terminal) inpoll() {
 	}
 }
 
+// RunCommand hands the byte slice off to the process running in Terminal. Note that this is an unbuffered channel,
+// but that a return from this method does not mean that the command has been executed, just that it has been written to the pty's
+// input queue.
 func (t *Terminal) RunCommand(cmd []byte) {
 	t.stdin <- cmd
 }
 
+// wraps the TIOCSTI syscall for writing to the input queue of a pts
+// https://man7.org/linux/man-pages/man2/ioctl_tty.2.html
 func tiocsti(f *os.File, b byte) error {
 	_, _, err := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TIOCSTI, uintptr(unsafe.Pointer(&b)))
 	if err != 0 {
@@ -168,6 +177,8 @@ func tiocsti(f *os.File, b byte) error {
 	return nil
 }
 
+// wraps the TIOCGTPN syscall to get the /dev/pts for an FD returned from opening /dev/ptmx
+// https://man7.org/linux/man-pages/man3/ptsname.3.html
 func ptsname(f *os.File) (string, error) {
 	var n int
 	_, _, err := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&n)))

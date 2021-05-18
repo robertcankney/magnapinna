@@ -1,5 +1,9 @@
+syntax = "proto3";
+option go_package = "github.com/robertcankney/magnapinna/api";
+
 service Magnapinna {
     rpc Register(Registration) returns (Lease) {}
+    rpc CheckRegistration(Registration) returns (Lease) {}
     rpc Deregister(Registration) returns (Lease) {}
     rpc JoinCluster(stream Output) returns (stream Command) {}
     rpc StartSession(stream Command) returns (stream Output) {}
@@ -7,4 +11,20 @@ service Magnapinna {
 
 message Registration {
     string identifier = 1;
+    int32 duration = 2;
+}
+
+message Lease {
+    string identifier = 1;
+    int32 duration = 2;
+    int32 status = 3;
+}
+
+message Command {
+    bytes contents = 1;
+}
+
+message Output {
+    int32 status = 1;
+    bytes content = 2;
 }
