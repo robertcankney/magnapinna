@@ -1,66 +1,83 @@
 package rpc
 
 import (
+	"io"
+	"io/ioutil"
+
 	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 )
 
+// TODO convert observability functions to gRPC interceptors
 type observer struct {
-	errs prometheus.CounterVec
+	errs     *prometheus.CounterVec
+	requests *prometheus.CounterVec
+	active   prometheus.Gauge
+	logger   *zap.SugaredLogger
 }
 
-// Describe sends the super-set of all possible descriptors of metrics
-// collected by this Collector to the provided channel and returns once
-// the last descriptor has been sent. The sent descriptors fulfill the
-// consistency and uniqueness requirements described in the Desc
-// documentation.
-//
-// It is valid if one and the same Collector sends duplicate
-// descriptors. Those duplicates are simply ignored. However, two
-// different Collectors must not send duplicate descriptors.
-//
-// Sending no descriptor at all marks the Collector as “unchecked”,
-// i.e. no checks will be performed at registration time, and the
-// Collector may yield any Metric it sees fit in its Collect method.
-//
-// This method idempotently sends the same descriptors throughout the
-// lifetime of the Collector. It may be called concurrently and
-// therefore must be implemented in a concurrency safe way.
-//
-// If a Collector encounters an error while executing this method, it
-// must send an invalid descriptor (created with NewInvalidDesc) to
-// signal the error to the registry.
-func (o *observer) Describe(_ chan<- *prometheus.Desc) {
-	panic("not implemented") // TODO: Implement
+func NewObserver(w io.Writer) *observer {
+	conf := zap.NewProductionConfig()
+	conf.OutputPaths = toZapKeys(w)
+	l, err := conf.Build()
+	if err != nil {
+		panic("failed to build zap logger - this is a code issue")
+	}
+	return &observer{
+		logger: l.Sugar(),
+		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "grpc_requests",
+			Help: "Counter of gRPC requests by calling context in application.",
+		}, []string{"caller"}),
+		errs: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "grpc_errors",
+			Help: "Counter of gRPC errors by calling context in application.",
+		}, []string{"caller"}),
+		active: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "active_sessions",
+			Help: "Number of active Magnapinna client sessions.",
+		}),
+	}
 }
 
-// Collect is called by the Prometheus registry when collecting
-// metrics. The implementation sends each collected metric via the
-// provided channel and returns once the last metric has been sent. The
-// descriptor of each sent metric is one of those returned by Describe
-// (unless the Collector is unchecked, see above). Returned metrics that
-// share the same descriptor must differ in their variable label
-// values.
-//
-// This method may be called concurrently and must therefore be
-// implemented in a concurrency safe way. Blocking occurs at the expense
-// of total performance of rendering all registered metrics. Ideally,
-// Collector implementations support concurrent readers.
-func (o *observer) Collect(_ chan<- prometheus.Metric) {
-	panic("not implemented") // TODO: Implement
+// Describe is part of the implememtation of prometheus.Collector.
+func (o *observer) Describe(desc chan<- *prometheus.Desc) {
+	o.requests.Describe(desc)
+	o.errs.Describe(desc)
+	o.active.Describe(desc)
 }
 
-func (o *observer) ObserveJoinFailure(err error) {
-
+// Collect is part of the implememtation of prometheus.Collector.
+func (o *observer) Collect(coll chan<- prometheus.Metric) {
+	o.requests.Collect(coll)
+	o.errs.Collect(coll)
+	o.active.Collect(coll)
 }
 
-func (o *observer) ObserveStartFailure(err error) {
-
+func (o *observer) ObserveGRPCCall(context string, err error) {
+	if err != nil {
+		o.errs.WithLabelValues(context).Inc()
+		o.logger.Errorw("gRPC call failed", "err", err)
+	}
+	o.requests.WithLabelValues(context).Inc()
 }
 
-func (o *observer) ObserveCommandFailure(err error) {
-
+func (o *observer) ObserveClientAddition(id string) {
+	o.logger.Infow("new client added", "client", id)
+	o.active.Inc()
 }
 
-func (o *observer) ObserveOutputFailure(err error) {
+func (o *observer) ObserveClientDeletion(id string) {
+	o.logger.Infow("client deleted", "client", id)
+	o.active.Inc()
+}
 
+// toZapKeys is a shim to deal zap requiring specific strings for writing to stdout/err, or not writing at all
+func toZapKeys(w io.Writer) []string {
+	switch w {
+	case ioutil.Discard:
+		return []string{}
+	default:
+		return []string{"stdout"}
+	}
 }

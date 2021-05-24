@@ -5,6 +5,8 @@ go 1.16
 require (
 	github.com/creack/pty v1.1.11
 	github.com/prometheus/client_golang v1.10.0
+	go.uber.org/zap v1.13.0
+	golang.org/x/oauth2 v0.0.0-20190226205417-e64efc72b421
 	golang.org/x/sys v0.0.0-20210507161434-a76c4d0a0096 // indirect
 	golang.org/x/term v0.0.0-20210503060354-a79de5458b56
 	google.golang.org/grpc v1.37.1
