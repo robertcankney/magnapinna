@@ -1,19 +1,24 @@
 package rpc
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"io/ioutil"
+	"magnapinna/api"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 )
 
 // TODO convert observability functions to gRPC interceptors
 type observer struct {
-	errs     *prometheus.CounterVec
-	requests *prometheus.CounterVec
-	active   prometheus.Gauge
-	logger   *zap.SugaredLogger
+	errs       *prometheus.CounterVec
+	requests   *prometheus.CounterVec
+	throughput *prometheus.CounterVec
+	active     prometheus.Gauge
+	logger     *zap.SugaredLogger
 }
 
 func NewObserver(w io.Writer) *observer {
@@ -37,6 +42,10 @@ func NewObserver(w io.Writer) *observer {
 			Name: "active_sessions",
 			Help: "Number of active Magnapinna client sessions.",
 		}),
+		throughput: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "grpc_errors",
+			Help: "Counter of gRPC errors by calling context in application.",
+		}, []string{"caller"}),
 	}
 }
 
@@ -70,6 +79,68 @@ func (o *observer) ObserveClientAddition(id string) {
 func (o *observer) ObserveClientDeletion(id string) {
 	o.logger.Infow("client deleted", "client", id)
 	o.active.Inc()
+}
+
+func (o *observer) ObserveThroughput(context string, length int) {
+	o.throughput.WithLabelValues(context).Add(float64(length))
+}
+
+func (o *observer) UnaryObserver() func(ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler) (interface{}, error) {
+
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		switch info.FullMethod {
+		case "/Magnapinna/Register":
+			//TODO fix this and below to get ID (maybe?) or move elsewhere
+			r, ok := req.(api.Registration)
+			if !ok {
+				return nil, fmt.Errorf("wrong type for gRPC endpoint: expected Registration, got %T", req)
+			}
+			o.ObserveClientAddition(r.Identifier)
+		}
+
+		resp, err := handler(ctx, req)
+		o.ObserveGRPCCall(info.FullMethod, err)
+		return resp, err
+	}
+}
+
+func (o *observer) StreamObserver() func(srv interface{},
+	stream grpc.ServerStream,
+	info *grpc.StreamServerInfo,
+	handler grpc.StreamHandler) error {
+
+	return func(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		var i interface{}
+		err := stream.RecvMsg(i)
+		if err != nil {
+			return fmt.Errorf("failed to receive gRPC message: %w", err)
+		}
+
+		length := 0
+		switch info.FullMethod {
+		case "/Magnapinna/StartSession":
+			//TODO fix this and below to get ID (maybe?) or move elsewhere
+			r, ok := i.(api.Command)
+			if !ok {
+				return fmt.Errorf("wrong type for gRPC endpoint: expected Registration, got %T", i)
+			}
+			length = len(r.Contents)
+		case "/Magnapinna/JoinCluster":
+			r, ok := i.(api.Output)
+			if !ok {
+				return fmt.Errorf("wrong type for gRPC endpoint: expected Registration, got %T", i)
+			}
+			length = len(r.Contents)
+		}
+		o.ObserveThroughput(info.FullMethod, length)
+
+		err = handler(srv, stream)
+		o.ObserveGRPCCall(info.FullMethod, err)
+		return err
+	}
 }
 
 // toZapKeys is a shim to deal zap requiring specific strings for writing to stdout/err, or not writing at all
