@@ -63,14 +63,14 @@ func (v ValidationError) Sanitized() string {
 }
 
 func (s *Server) CheckRegistration(ctx context.Context, rs *api.Registration) (*api.Lease, error) {
-	if !rsValid(rs) {
+	if !registrationValid(rs) {
 		return nil, ValidationError{s: "missing required fields"}
 	}
 	return s.repository.FetchLease(ctx, rs)
 }
 
 func (s *Server) Register(ctx context.Context, rs *api.Registration) (*api.Lease, error) {
-	if !rsValid(rs) {
+	if !registrationValid(rs) {
 		return nil, ValidationError{s: "missing required fields"}
 	}
 	lease, err := s.repository.FetchLease(ctx, rs)
@@ -85,7 +85,7 @@ func (s *Server) Register(ctx context.Context, rs *api.Registration) (*api.Lease
 }
 
 func (s *Server) Deregister(ctx context.Context, rs *api.Registration) (*api.Lease, error) {
-	if !rsValid(rs) {
+	if !registrationValid(rs) {
 		return nil, ValidationError{s: "missing required fields"}
 	}
 	lease, err := s.repository.FetchLease(ctx, rs)
@@ -102,7 +102,6 @@ func (s *Server) Deregister(ctx context.Context, rs *api.Registration) (*api.Lea
 func (s *Server) JoinCluster(join api.Magnapinna_JoinClusterServer) error {
 	init, err := join.Recv()
 	if err != nil {
-		s.observer.ObserveGRPCCall("join_cluster_recv", err)
 		return err
 	}
 
@@ -122,7 +121,6 @@ func (s *Server) JoinCluster(join api.Magnapinna_JoinClusterServer) error {
 	if err != nil {
 		return err
 	}
-	s.observer.ObserveClientAddition(init.Identifier)
 
 	done := join.Context().Done()
 	<-done
@@ -133,14 +131,13 @@ func (s *Server) JoinCluster(join api.Magnapinna_JoinClusterServer) error {
 func (s *Server) StartSession(sess api.Magnapinna_StartSessionServer) error {
 	init, err := sess.Recv()
 	if err != nil {
-		s.observer.ObserveGRPCCall("start_session_init_recv", err)
 		return err
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, s.timeout)
+	defer cancel()
 	_, err = s.CheckRegistration(ctx, &api.Registration{
 		Identifier: init.Identifier,
 	})
-	cancel()
 	if err != nil {
 		return err
 	}
@@ -162,19 +159,23 @@ func (s *Server) StartSession(sess api.Magnapinna_StartSessionServer) error {
 			// this is to prevent potentially clobbering input/output from other commands
 			cmd, err := sess.Recv()
 			if err != nil {
-				s.observer.ObserveGRPCCall("start_session_recv", err)
+				s.observer.ObserveReceiveError("sess_recv", err)
+				continue
 			}
 			err = remote.Send(cmd)
 			if err != nil {
-				s.observer.ObserveGRPCCall("start_session_cmd_send", err)
+				s.observer.ObserveSendError("join_send", err)
+				continue
 			}
 			output, err := remote.Recv()
 			if err != nil {
-				s.observer.ObserveGRPCCall("start_session_output_recv", err)
+				s.observer.ObserveReceiveError("join_recv", err)
+				continue
 			}
 			err = sess.Send(output)
 			if err != nil {
-				s.observer.ObserveGRPCCall("start_session_output_send", err)
+				s.observer.ObserveSendError("sess_send", err)
+				continue
 			}
 		}
 	}
@@ -201,7 +202,7 @@ func (c *ConnCache) getClient(id string) (api.Magnapinna_JoinClusterServer, erro
 	return client, nil
 }
 
-func rsValid(rs *api.Registration) bool {
+func registrationValid(rs *api.Registration) bool {
 	return rs.Duration != 0 && rs.Identifier != ""
 }
 

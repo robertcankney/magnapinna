@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/credentials/oauth"
 )
 
+// Client...
 type Client struct {
 	grpc     api.MagnapinnaClient
 	observer *observer
@@ -32,6 +33,7 @@ func NewClient(opts ClientOpts) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return &Client{
 		grpc:    api.NewMagnapinnaClient(conn),
 		id:      opts.ID,
@@ -44,6 +46,7 @@ func NewClient(opts ClientOpts) (*Client, error) {
 func (c *Client) Register() (*api.Lease, error) {
 	ctx, cancel := context.WithTimeout(c.ctx, c.timeout)
 	defer cancel()
+
 	return c.grpc.Register(ctx, &api.Registration{
 		Duration:   int32(c.lease.Seconds()),
 		Identifier: c.id,
